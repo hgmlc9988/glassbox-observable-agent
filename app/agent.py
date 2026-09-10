@@ -16,13 +16,15 @@ Span structure produced by one run:
 `plan` and `execute_tool` spans are siblings under `invoke_agent`. Loop
 iterations do not nest inside each other.
 
+The root span carries the question as its input and the final answer as its
+output, so a trace is identifiable from the list view without opening it. Early
+versions did not, and every trace looked identical from outside.
+
 Two behaviours added after observing real runs:
 
   Forced synthesis. Early versions returned nothing when the turn budget ran
-  out, even with a dozen facts gathered. An agent that does the research and
-  then refuses to speak is worse than one that answers with a caveat. On the
-  last turn, if any claims exist, it answers and marks the result
-  low-confidence.
+  out, even with a dozen facts gathered. On the last turn, if any claims exist,
+  it answers and marks the result low-confidence.
 
   Transient error tolerance. A single dropped connection used to destroy a
   whole run. Network failures now cost one turn instead of everything.
@@ -39,7 +41,7 @@ from typing import TypedDict
 from opentelemetry.trace import Status, StatusCode
 
 import chaos
-from telemetry import WORKFLOW_NAME, tracer
+from telemetry import WORKFLOW_NAME, set_input, set_output, tracer
 from tools import _chat, extract_claims, fetch_page, synthesize, web_search
 
 MAX_ITERATIONS = 12
@@ -101,6 +103,15 @@ def plan(state: State) -> dict:
         )
         unread = len(state["unread_urls"])
         unextracted = sum(1 for p in state["read_pages"] if not p["extracted"])
+
+        set_input(
+            span,
+            f"turn {state['iteration']} | "
+            f"{len(state['claims'])} facts | "
+            f"{len(state['sources'])} sources | "
+            f"{unread} unread | "
+            f"{unextracted} unextracted",
+        )
 
         prompt = f"""You are the planner for a research agent answering a question about
 banking and financial regulation.
@@ -178,6 +189,12 @@ No markdown, no code fences."""
         span.set_attribute("glassbox.reasoning", decision.get("reasoning", ""))
         span.set_attribute("glassbox.source_count", len(state["sources"]))
         span.set_attribute("glassbox.unread_count", unread)
+
+        set_output(
+            span,
+            f"{action} (coverage {coverage:.2f})"
+            f"{' [FORCED]' if forced else ''} — {decision.get('reasoning', '')}",
+        )
 
         return {
             "next_action": action,
@@ -263,6 +280,7 @@ def run(question: str, verbose: bool = True) -> State:
             "gen_ai.conversation.id", state["conversation_id"]
         )
         workflow_span.set_attribute("glassbox.chaos_mode", chaos.MODE)
+        set_input(workflow_span, question)
 
         with tracer().start_as_current_span("invoke_agent researcher") as agent_span:
             agent_span.set_attribute("gen_ai.operation.name", "invoke_agent")
@@ -270,6 +288,7 @@ def run(question: str, verbose: bool = True) -> State:
             agent_span.set_attribute(
                 "gen_ai.conversation.id", state["conversation_id"]
             )
+            set_input(agent_span, question)
 
             _loop(state, verbose)
 
@@ -278,6 +297,7 @@ def run(question: str, verbose: bool = True) -> State:
             agent_span.set_attribute(
                 "glassbox.answer_confidence", state["answer_confidence"]
             )
+            set_output(agent_span, state["answer"] or "(no answer produced)")
 
             if state["stop_reason"] == "turn_limit_reached":
                 agent_span.set_status(Status(StatusCode.ERROR))
@@ -303,6 +323,7 @@ def run(question: str, verbose: bool = True) -> State:
         workflow_span.set_attribute(
             "glassbox.answer_confidence", state["answer_confidence"]
         )
+        set_output(workflow_span, state["answer"] or "(no answer produced)")
 
     return state
 
