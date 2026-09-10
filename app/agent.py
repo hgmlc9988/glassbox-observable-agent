@@ -14,8 +14,18 @@ Span structure produced by one run:
         ...
 
 `plan` and `execute_tool` spans are siblings under `invoke_agent`. Loop
-iterations do not nest inside each other — six nested iterations would run off
-the edge of any trace viewer and make comparison between them impossible.
+iterations do not nest inside each other.
+
+Two behaviours added after observing real runs:
+
+  Forced synthesis. Early versions returned nothing when the turn budget ran
+  out, even with a dozen facts gathered. An agent that does the research and
+  then refuses to speak is worse than one that answers with a caveat. On the
+  last turn, if any claims exist, it answers and marks the result
+  low-confidence.
+
+  Transient error tolerance. A single dropped connection used to destroy a
+  whole run. Network failures now cost one turn instead of everything.
 
 Deliberate omission: nothing here detects that the agent is repeating a search
 it already ran. A production agent should catch that. This one must not, because
@@ -28,13 +38,17 @@ from typing import TypedDict
 
 from opentelemetry.trace import Status, StatusCode
 
+import chaos
 from telemetry import WORKFLOW_NAME, tracer
 from tools import _chat, extract_claims, fetch_page, synthesize, web_search
 
 MAX_ITERATIONS = 12
-COVERAGE_THRESHOLD = 0.85
-MIN_SOURCES = 3
+COVERAGE_THRESHOLD = chaos.coverage_threshold(0.85)
+MIN_SOURCES = chaos.min_sources(3)
 SEARCH_BACKLOG_LIMIT = 3
+
+# Turns reserved at the end for producing an answer from whatever was gathered.
+RESERVE_TURNS = 1
 
 
 class State(TypedDict):
@@ -44,10 +58,13 @@ class State(TypedDict):
     unread_urls: list[str]
     read_pages: list[dict]
     failed_fetches: list[dict]
+    failed_extractions: list[dict]
+    transient_errors: list[dict]
     claims: list[dict]
     sources: list[str]
     iteration: int
     answer: str
+    answer_confidence: str
     stop_reason: str
 
 
@@ -59,10 +76,13 @@ def new_state(question: str) -> State:
         "unread_urls": [],
         "read_pages": [],
         "failed_fetches": [],
+        "failed_extractions": [],
+        "transient_errors": [],
         "claims": [],
         "sources": [],
         "iteration": 0,
         "answer": "",
+        "answer_confidence": "",
         "stop_reason": "",
     }
 
@@ -120,7 +140,7 @@ No markdown, no code fences."""
 
         try:
             decision = _parse_json_object(raw)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError):
             span.set_status(Status(StatusCode.ERROR))
             span.set_attribute("error.type", "unparseable_planner_output")
             raise
@@ -129,9 +149,7 @@ No markdown, no code fences."""
         coverage = float(decision.get("coverage_score", 0.0))
         action = requested
 
-        # The planner proposes; these rules dispose. Without them the planner
-        # can choose an action there is no material for, answer prematurely, or
-        # spend every turn searching.
+        # The planner proposes; these rules dispose.
         if action == "fetch_page" and unread == 0:
             action = "extract_claims" if unextracted else "web_search"
         if action == "extract_claims" and unextracted == 0:
@@ -145,10 +163,18 @@ No markdown, no code fences."""
         if action == "synthesize" and len(state["sources"]) < MIN_SOURCES:
             action = "fetch_page" if unread else "web_search"
 
+        # Last turn: answer with what we have rather than returning nothing.
+        forced = False
+        turns_left = MAX_ITERATIONS - state["iteration"]
+        if turns_left < RESERVE_TURNS and state["claims"] and action != "synthesize":
+            action = "synthesize"
+            forced = True
+
         span.set_attribute("glassbox.coverage_score", coverage)
         span.set_attribute("glassbox.next_action", action)
         span.set_attribute("glassbox.requested_action", requested)
         span.set_attribute("glassbox.action_overridden", action != requested)
+        span.set_attribute("glassbox.forced_synthesis", forced)
         span.set_attribute("glassbox.reasoning", decision.get("reasoning", ""))
         span.set_attribute("glassbox.source_count", len(state["sources"]))
         span.set_attribute("glassbox.unread_count", unread)
@@ -158,6 +184,7 @@ No markdown, no code fences."""
             "coverage_score": coverage,
             "reasoning": decision.get("reasoning", ""),
             "query": decision.get("query", state["question"]),
+            "forced": forced,
         }
 
 
@@ -175,12 +202,7 @@ def do_search(state: State, query: str) -> None:
 
 
 def do_fetch(state: State) -> None:
-    """Open the next unread page.
-
-    A 403, 404 or timeout is recorded and the run continues. The failure is not
-    hidden — fetch_page already marks its span as ERROR, and the URL lands in
-    failed_fetches.
-    """
+    """Open the next unread page. Failures are recorded, not fatal."""
     url = state["unread_urls"].pop(0)
     try:
         text = fetch_page(url)
@@ -192,19 +214,40 @@ def do_fetch(state: State) -> None:
 
 
 def do_extract(state: State) -> None:
+    """Mine an opened page for facts.
+
+    Unparseable output marks the page done, so it is not retried forever.
+    A network failure leaves the page unextracted so it can be tried again.
+    """
     page = next(p for p in state["read_pages"] if not p["extracted"])
-    found = extract_claims(page["text"], state["question"])
+    try:
+        found = extract_claims(page["text"], state["question"])
+    except ValueError:
+        page["extracted"] = True
+        state["failed_extractions"].append(
+            {"url": page["url"], "error": "unparseable_model_output"}
+        )
+        print(f"           extraction failed: {page['url']} (unparseable output)")
+        return
+    except Exception as exc:
+        state["transient_errors"].append(
+            {"where": "extract_claims", "error": type(exc).__name__}
+        )
+        print(f"           transient error in extraction ({type(exc).__name__})")
+        return
+
     page["extracted"] = True
     state["claims"].extend(found)
     if found and page["url"] not in state["sources"]:
         state["sources"].append(page["url"])
 
 
-def do_synthesize(state: State) -> None:
+def do_synthesize(state: State, forced: bool) -> None:
     state["answer"] = synthesize(
         state["claims"], state["question"], state["sources"]
     )
-    state["stop_reason"] = "answered"
+    state["answer_confidence"] = "low" if forced else "normal"
+    state["stop_reason"] = "answered_forced" if forced else "answered"
 
 
 def run(question: str, verbose: bool = True) -> State:
@@ -219,10 +262,9 @@ def run(question: str, verbose: bool = True) -> State:
         workflow_span.set_attribute(
             "gen_ai.conversation.id", state["conversation_id"]
         )
+        workflow_span.set_attribute("glassbox.chaos_mode", chaos.MODE)
 
-        with tracer().start_as_current_span(
-            "invoke_agent researcher"
-        ) as agent_span:
+        with tracer().start_as_current_span("invoke_agent researcher") as agent_span:
             agent_span.set_attribute("gen_ai.operation.name", "invoke_agent")
             agent_span.set_attribute("gen_ai.agent.name", "researcher")
             agent_span.set_attribute(
@@ -233,6 +275,9 @@ def run(question: str, verbose: bool = True) -> State:
 
             agent_span.set_attribute("glassbox.iterations", state["iteration"])
             agent_span.set_attribute("glassbox.stop_reason", state["stop_reason"])
+            agent_span.set_attribute(
+                "glassbox.answer_confidence", state["answer_confidence"]
+            )
 
             if state["stop_reason"] == "turn_limit_reached":
                 agent_span.set_status(Status(StatusCode.ERROR))
@@ -248,7 +293,16 @@ def run(question: str, verbose: bool = True) -> State:
         workflow_span.set_attribute(
             "glassbox.failed_fetch_count", len(state["failed_fetches"])
         )
+        workflow_span.set_attribute(
+            "glassbox.failed_extraction_count", len(state["failed_extractions"])
+        )
+        workflow_span.set_attribute(
+            "glassbox.transient_error_count", len(state["transient_errors"])
+        )
         workflow_span.set_attribute("glassbox.answered", bool(state["answer"]))
+        workflow_span.set_attribute(
+            "glassbox.answer_confidence", state["answer_confidence"]
+        )
 
     return state
 
@@ -256,30 +310,46 @@ def run(question: str, verbose: bool = True) -> State:
 def _loop(state: State, verbose: bool) -> None:
     while state["iteration"] < MAX_ITERATIONS:
         state["iteration"] += 1
-        decision = plan(state)
+
+        try:
+            decision = plan(state)
+        except Exception as exc:
+            state["transient_errors"].append(
+                {"where": "plan", "error": type(exc).__name__}
+            )
+            print(f"           transient error in planner ({type(exc).__name__})")
+            continue
+
         action = decision["next_action"]
 
         if verbose:
+            marker = " [FORCED]" if decision.get("forced") else ""
             print(
                 f"[turn {state['iteration']:2d}] {action:<16} "
                 f"coverage={decision['coverage_score']:.2f}  "
                 f"sources={len(state['sources'])}  "
                 f"unread={len(state['unread_urls'])}  "
-                f"{decision['reasoning']}"
+                f"{decision['reasoning']}{marker}"
             )
 
-        if action == "web_search":
-            do_search(state, decision["query"])
-        elif action == "fetch_page":
-            do_fetch(state)
-        elif action == "extract_claims":
-            do_extract(state)
-        elif action == "synthesize":
-            do_synthesize(state)
-            return
-        else:
-            state["stop_reason"] = f"unknown action: {action}"
-            return
+        try:
+            if action == "web_search":
+                do_search(state, decision["query"])
+            elif action == "fetch_page":
+                do_fetch(state)
+            elif action == "extract_claims":
+                do_extract(state)
+            elif action == "synthesize":
+                do_synthesize(state, decision.get("forced", False))
+                return
+            else:
+                state["stop_reason"] = f"unknown action: {action}"
+                return
+        except Exception as exc:
+            state["transient_errors"].append(
+                {"where": action, "error": type(exc).__name__}
+            )
+            print(f"           transient error in {action} ({type(exc).__name__})")
 
     state["stop_reason"] = "turn_limit_reached"
 
