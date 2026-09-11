@@ -16,18 +16,20 @@ sources, instrumented so that every run is a trace you can open and read.
 
 Four public traces. No sign-in.
 
-| | Run | What it shows |
-|---|---|---|
-| 1 | [Healthy](https://us.cloud.langfuse.com/project/cmtw2asiz01hdad0dbfisnzyv/traces/c2ed80c7809d3b6cf718e4222b54f7e4) | 8 turns, 3 sources, clean cited answer |
-| 2 | [Degraded](https://us.cloud.langfuse.com/project/cmtw2asiz01hdad0dbfisnzyv/traces/f0096f66cf0a162c67cd8f80bfbc0dae) | 12 turns, **12 searches** to open 4 pages |
-| 3 | [Before a fix](https://us.cloud.langfuse.com/project/cmtw2asiz01hdad0dbfisnzyv/traces/eb24a20458d6735c9aca74985e4b6029) | Budget exhausted, nothing returned |
-| 4 | [After that fix](https://us.cloud.langfuse.com/project/cmtw2asiz01hdad0dbfisnzyv/traces/c1fc5a23f3110b385d4cd4efaec55436) | Same question, cited answer delivered |
+| Run | Latency | Cost | Tokens | What it shows |
+|---|---|---|---|---|
+| [Healthy](https://us.cloud.langfuse.com/project/cmtw2asiz01hdad0dbfisnzyv/traces/c2ed80c7809d3b6cf718e4222b54f7e4) | 42s | $0.0139 | 13,468 | 8 turns, 3 sources, clean cited answer |
+| [Budget exhausted, answer delivered](https://us.cloud.langfuse.com/project/cmtw2asiz01hdad0dbfisnzyv/traces/f0096f66cf0a162c67cd8f80bfbc0dae) | 1m 06s | $0.0351 | 29,891 | 12 turns, **12 searches** to open 4 pages |
+| [Budget exhausted, nothing returned](https://us.cloud.langfuse.com/project/cmtw2asiz01hdad0dbfisnzyv/traces/eb24a20458d6735c9aca74985e4b6029) | 1m 14s | $0.0252 | 16,985 | All the research happened, none of it reached the user |
+| [Answers despite blocked sources](https://us.cloud.langfuse.com/project/cmtw2asiz01hdad0dbfisnzyv/traces/c1fc5a23f3110b385d4cd4efaec55436) | 1m 17s | $0.0312 | 22,968 | Two sites return 403, run completes anyway |
 
-Traces 3 and 4 are the pair worth reading together. Same question, same tooling,
-same two sites blocking the agent. One returns nothing; one returns an answer.
-Neither logs an error that a monitoring dashboard would catch.
+Runs 2 and 3 are the pair worth reading together. Both hit the turn limit. One
+produces a cited answer marked low-confidence; the other produces nothing at
+all. The difference is a fallback added after seeing run 3 in a trace.
 
-Full notes on each in [docs/demo-traces.md](docs/demo-traces.md).
+Neither logs an error a monitoring dashboard would catch.
+
+Full notes in [docs/demo-traces.md](docs/demo-traces.md).
 
 ---
 
@@ -65,6 +67,10 @@ the code — which is the whole reason this needs tracing.
 The GenAI conventions are still marked Development, so instrumentation sets
 `OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental` to emit the newer
 attribute names rather than the pre-1.36 ones.
+
+Input and output are written under both `input.value` (vendor-neutral) and
+`langfuse.observation.input` (what Langfuse reads first), so the instrumentation
+is not tied to one backend.
 
 ---
 
@@ -106,26 +112,30 @@ under `glassbox.*` — no invented `gen_ai.` names.
 None of this was predictable from reading the code.
 
 **The planner is most of the bill.** Across 14 runs: 198 `chat` spans, 142 of
-them from the planner. Roughly 72% of model spend is the agent deciding what to
+them from the planner. Roughly 72% of model calls are the agent deciding what to
 do, not doing it. Every optimisation instinct says to shrink the extraction
 prompt. The traces say to shrink the planning loop.
 
-**The stopping rule measured the wrong thing.** Trace 2 ran twelve searches to
-open four pages, three of them consecutively with the same reason: it needed a
-third source. It already had nineteen facts. The rule counted distinct sources
-rather than whether the question was answered. The answer was fine. The route
-was wasteful, and only the trace shows it.
+**The stopping rule measured the wrong thing.** Run 2 above made twelve searches
+to open four pages, three of them consecutive with the same stated reason: it
+needed a third source. It already had nineteen facts. The rule counted distinct
+*sources* rather than whether the question was answered. The answer was fine;
+the route was wasteful, and only the trace shows it.
 
 **Returning nothing was worse than answering with a caveat.** Three of five
-questions originally ended with facts gathered and no output. Forced synthesis
-on the final turn — answer anyway, mark it low confidence — turned those into
-usable results. The `plan` span records `glassbox.forced_synthesis` so these
-runs stay identifiable.
+questions originally ended with facts gathered and no output — run 3 above is
+one of them. Forced synthesis on the final turn (answer anyway, mark it low
+confidence) turned those into usable results. The `plan` span records
+`glassbox.forced_synthesis` so these runs stay identifiable.
 
 **Roughly a third of fetches are refused.** Reuters, Wolters Kluwer, Atlantic
 Council and others return 403 to anything that is not a browser. An agent
 researching the open web is at the mercy of who lets it in, and the failed-fetch
 count per run is a real quality signal.
+
+**Run-to-run variance is large.** Two runs of the same question, minutes apart,
+differ by 6,000 tokens and produce different outcomes. Any evaluation of an
+agent over the live web needs repeated runs, not one.
 
 ---
 
@@ -201,6 +211,9 @@ throwaway demo and the wrong call for anything real.
 - Measure sufficiency, not source count. The corroboration rule is the single
   biggest source of wasted turns.
 - Cache fetched pages. Repeated runs re-download the same URLs.
-- Shrink the planner prompt before touching anything else. It is 72% of spend.
-- Add a retry with backoff on 403s using a different User-Agent, and record the
-  retry as its own span rather than hiding it inside the fetch.
+- Shrink the planner prompt before touching anything else. It is 72% of model
+  calls.
+- Retry 403s with a different User-Agent, and record the retry as its own span
+  rather than hiding it inside the fetch.
+- Run each question five times before drawing conclusions. Single runs over the
+  live web are not evidence.
